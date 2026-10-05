@@ -1,0 +1,566 @@
+import Foundation
+import HAPKit
+import Observation
+
+/// Browsing the player's music drive, and deleting only what the user selects and confirms.
+@MainActor @Observable
+final class DriveModel {
+    private(set) var drive: HAPDrive?
+    private(set) var connectError: String?
+    private(set) var isConnecting = false
+    private(set) var folder: URL?
+    private(set) var items: [DriveItem] = []
+    private(set) var listError: String?
+    private(set) var isLoadingFolder = false
+    /// The player's library tracks for the music files in this folder, by file name
+    /// (from the player's own folder view). Nil while being asked.
+    private(set) var folderTracks: [String: Track]?
+    @ObservationIgnored private var loadToken = UUID()
+    var selection = Set<URL>()
+
+    /// Contents of the current selection: file count (fast) and size (slow), both in the background.
+    private(set) var selectionSummary: DriveSummary?
+    private(set) var selectionSize: Int64?
+
+    /// Set when the user clicked Delete…; the confirmation dialog shows it.
+    private(set) var pendingDeletion: PendingDeletion?
+    private(set) var isDeleting = false
+    /// Files deleted so far, and how many there are in total (while deleting).
+    private(set) var deletedFiles = 0
+    private(set) var filesToDelete = 0
+    /// Result of the last deletion, shown as a message.
+    private(set) var lastResult: String?
+
+    struct PendingDeletion {
+        let urls: [URL]
+        let names: [String]
+        let summary: DriveSummary
+        /// Nil if the size is still being counted.
+        let size: Int64?
+        /// Set when some items didn't come from this Mac, or their originals are gone.
+        let onlyCopyWarning: String?
+    }
+
+    @ObservationIgnored let locator = OriginalLocator()
+    @ObservationIgnored private var countTask: Task<Void, Never>?
+    @ObservationIgnored private var sizeTask: Task<Int64, Never>?
+    @ObservationIgnored private var deleteTask: Task<Void, Error>?
+
+    // MARK: Copying to the player (drag and drop)
+
+    /// Set after a drop; the confirmation dialog shows it.
+    private(set) var pendingUpload: UploadPlan?
+    private(set) var isPlanningUpload = false
+    private(set) var isUploading = false
+    private(set) var uploadProgress = UploadProgress()
+    private(set) var uploadTotalFiles = 0
+    private(set) var uploadTotalBytes: Int64 = 0
+    @ObservationIgnored private var uploadTask: Task<Void, Error>?
+
+    /// Why the current folder can't take a drop, or nil if it can.
+    var dropBlocker: String? {
+        guard let drive, let folder else { return "The drive isn't connected." }
+        do {
+            try drive.checkUploadTarget(folder)
+            return nil
+        } catch {
+            return PlayerModel.message(for: error)
+        }
+    }
+
+    /// Step 1 after a drop: work out what would be copied (nothing is copied yet).
+    func prepareUpload(_ urls: [URL], extensions: Set<String>) async {
+        guard let drive, let folder, !isUploading else { return }
+        isPlanningUpload = true
+        defer { isPlanningUpload = false }
+        do {
+            let plan = try await Task.detached {
+                try drive.planUpload(urls, into: folder, allowedExtensions: extensions)
+            }.value
+            if plan.items.isEmpty {
+                lastResult = "Nothing to copy." + Self.skipSummary(plan.skipped)
+            } else {
+                pendingUpload = plan
+            }
+        } catch {
+            lastResult = PlayerModel.message(for: error)
+        }
+    }
+
+    func cancelUpload() { pendingUpload = nil }
+
+    /// Step 2: only after the user confirmed. Copies with progress; `stopUploading()` stops it.
+    func confirmUpload(_ plan: UploadPlan) async {
+        guard let drive, !hosts.isEmpty else { return }
+        pendingUpload = nil
+        isUploading = true
+        uploadProgress = UploadProgress()
+        uploadTotalFiles = plan.items.count
+        uploadTotalBytes = plan.totalBytes
+        lastResult = nil
+        let throttle = ProgressThrottle()
+        // A session reconnects after every file and retries stalled files: the player's file
+        // sharing drops connections after files are written (NOTES.md, "Uploads").
+        let session = UploadSession(hosts: hosts, drive: drive)
+        let folderPath = folder.map { drive.relativePath(of: $0) } ?? ""
+        let task = Task.detached {
+            try session.upload(plan) { progress in
+                guard throttle.shouldReport(progress) else { return }
+                Task { @MainActor [weak self] in self?.uploadProgress = progress }
+            }
+        }
+        uploadTask = task
+        defer {
+            // The drive may now be connected at a different folder on the Mac.
+            let fresh = session.drive
+            self.drive = fresh
+            folder = folderPath.isEmpty ? fresh.root : fresh.root.appendingPathComponent(folderPath)
+        }
+        do {
+            try await task.value
+            let recovered = session.retries > 0 ? " (\(session.retries) connection drop\(session.retries == 1 ? "" : "s") recovered)" : ""
+            let leftovers = session.leftoverTemporaryFiles > 0
+                ? " \(session.leftoverTemporaryFiles) hidden temporary file\(session.leftoverTemporaryFiles == 1 ? "" : "s") couldn't be removed yet; the next upload into this folder cleans \(session.leftoverTemporaryFiles == 1 ? "it" : "them") up."
+                : ""
+            lastResult = "Copied \(plan.items.count) file\(plan.items.count == 1 ? "" : "s") (\(Self.bytes(plan.totalBytes))) to the player\(recovered)."
+                + Self.skipSummary(plan.skipped) + leftovers
+                + " The player adds new music to its library by itself; use Refresh Library to see it."
+        } catch is CancellationError {
+            lastResult = "Stopped. \(uploadProgress.filesDone) of \(plan.items.count) files were copied. Drop the same files again to continue: complete ones are skipped."
+        } catch {
+            lastResult = "Copying stopped: \(PlayerModel.message(for: error)) \(uploadProgress.filesDone) files were copied before that. "
+                + "Drop the same files again to continue: complete ones are skipped."
+        }
+        uploadTask = nil
+        isUploading = false
+        reload()
+    }
+
+    func stopUploading() { uploadTask?.cancel() }
+
+    /// e.g. " Skipped 3: 2 not music files the player plays, 1 already on the player."
+    static func skipSummary(_ skipped: [UploadSkip]) -> String {
+        guard !skipped.isEmpty else { return "" }
+        let counts = Dictionary(grouping: skipped, by: \.reason).map { "\($0.value.count) \($0.key)" }.sorted()
+        return " Skipped \(skipped.count): " + counts.joined(separator: ", ") + "."
+    }
+
+    /// Ways to reach the drive, in order: the player's network name (e.g. "HAP-Z1ES"; the
+    /// per-player SMB1 setting in nsmb.conf is keyed on it), then its address as a fallback.
+    @ObservationIgnored private var hosts: [String] = []
+
+    func connect(hosts: [String]) async {
+        self.hosts = hosts
+        guard drive == nil, !isConnecting else { return }
+        isConnecting = true
+        defer { isConnecting = false }
+        do {
+            let drive = try await HAPDrive.connect(hosts: hosts)
+            self.drive = drive
+            connectError = nil
+            open(drive.root)
+            tidyMounts(keeping: drive)
+        } catch {
+            connectError = PlayerModel.message(for: error)
+        }
+    }
+
+    /// If the drive's connection was lost (e.g. the player dropped it), connect again and
+    /// reopen the same folder.
+    func reconnect() async {
+        guard !hosts.isEmpty, let old = drive else { return }
+        let path = folder.map { old.relativePath(of: $0) } ?? ""
+        do {
+            let fresh = try await HAPDrive.connect(hosts: hosts)
+            drive = fresh
+            connectError = nil
+            tidyMounts(keeping: fresh)
+            open(path.isEmpty ? fresh.root : fresh.root.appendingPathComponent(path), retryOnFailure: false)
+        } catch {
+            listError = PlayerModel.message(for: error)
+        }
+    }
+
+    /// Extra mounts of the drive left from earlier reconnects are disconnected (in the
+    /// background: a dead mount could otherwise make the window wait).
+    private func tidyMounts(keeping drive: HAPDrive) {
+        let hosts = self.hosts
+        Task.detached { HAPDrive.removeDuplicateMounts(hosts: hosts, keeping: drive.root) }
+    }
+
+    func open(_ url: URL) { open(url, retryOnFailure: true) }
+
+    /// Lists the folder in the background (a slow or stuck drive must never freeze the window),
+    /// then asks the player which of its music files are in its library.
+    private func open(_ url: URL, retryOnFailure: Bool) {
+        guard let drive else { return }
+        folder = url
+        selection = []
+        selectionSummary = nil
+        selectionSize = nil
+        folderTracks = nil
+        isLoadingFolder = true
+        let token = UUID()
+        loadToken = token
+        Task {
+            let result = await Task.detached { Result { try drive.items(in: url) } }.value
+            guard loadToken == token else { return }  // another folder was opened meanwhile
+            isLoadingFolder = false
+            switch result {
+            case .success(let list):
+                items = list
+                listError = nil
+                await loadFolderTracks(for: url, token: token)
+            case .failure(let error):
+                items = []
+                listError = PlayerModel.message(for: error)
+                if retryOnFailure { await reconnect() }
+            }
+        }
+    }
+
+    @ObservationIgnored weak var player: PlayerModel?
+
+    private func loadFolderTracks(for url: URL, token: UUID) async {
+        guard let drive, let client = player?.client,
+              items.contains(where: { !$0.isFolder }) else { folderTracks = [:]; return }
+        let path = drive.relativePath(of: url).split(separator: "/").map(String.init)
+        let tracks = (try? await client.tracksInFolder(path)) ?? [:]
+        guard loadToken == token else { return }
+        folderTracks = tracks
+        watchUnindexedFiles(path: path, token: token)
+    }
+
+    /// The player adds new files to its library a little while after they're copied, so while
+    /// some files here aren't in it yet, ask again every 15 s for up to 5 minutes (read-only).
+    private func watchUnindexedFiles(path: [String], token: UUID) {
+        guard hasUnindexedFiles else { return }
+        Task {
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .seconds(15))
+                guard loadToken == token, hasUnindexedFiles else { return }
+                if isUploading || isDeleting { continue }  // don't disturb the player while it's busy
+                guard let client = player?.client, let fresh = try? await client.tracksInFolder(path),
+                      loadToken == token else { continue }
+                if fresh.count > (folderTracks?.count ?? 0) {
+                    folderTracks = fresh
+                    await player?.refreshLibrary()  // show the new tracks in Albums/Tracks too
+                }
+            }
+        }
+    }
+
+    private var hasUnindexedFiles: Bool {
+        folderTracks != nil && items.contains { !$0.isFolder && track(for: $0) == nil }
+    }
+
+    /// The library track for a music file in the current folder, if the player has it.
+    func track(for item: DriveItem) -> Track? {
+        guard let folderTracks else { return nil }
+        return folderTracks[item.name] ?? folderTracks.first { $0.key.precomposedStringWithCanonicalMapping == item.name.precomposedStringWithCanonicalMapping }?.value
+    }
+
+    /// Plays a music file, and the folder's other music after it.
+    func play(_ item: DriveItem) async {
+        guard let player else { return }
+        guard let track = track(for: item) else {
+            lastResult = folderTracks == nil
+                ? "Still asking the player about this folder; try again in a moment."
+                : "The player hasn't added “\(item.name)” to its library yet, so it can't be played from here. It usually does so within a few minutes of copying."
+            return
+        }
+        let playable = items.filter { !$0.isFolder }.compactMap { self.track(for: $0) }
+        let start = playable.firstIndex { $0.trackid == track.trackid } ?? 0
+        await player.play(playable, from: start, title: breadcrumbs.last?.name ?? "Folder")
+    }
+
+    func reload() { if let folder { open(folder) } }
+
+    /// Breadcrumbs from the drive's top level to the current folder.
+    var breadcrumbs: [(name: String, url: URL)] {
+        guard let drive, let folder else { return [] }
+        var crumbs = [(name: "HAP_Internal", url: drive.root)]
+        var url = drive.root
+        for part in drive.relativePath(of: folder).split(separator: "/") {
+            url = url.appendingPathComponent(String(part), isDirectory: true)
+            crumbs.append((name: String(part), url: url))
+        }
+        return crumbs
+    }
+
+    /// Tick / untick one item (the checkboxes), keeping the rest of the selection.
+    func toggle(_ url: URL) {
+        if selection.contains(url) { selection.remove(url) } else { selection.insert(url) }
+    }
+
+    func selectionChanged() {
+        countTask?.cancel()
+        sizeTask?.cancel()
+        selectionSummary = nil
+        selectionSize = nil
+        guard let drive, !selection.isEmpty else { return }
+        let urls = Array(selection)
+        let size = Task.detached { drive.size(of: urls) }
+        sizeTask = size
+        countTask = Task {
+            let summary = await Task.detached { drive.count(urls) }.value
+            guard !Task.isCancelled else { return }
+            selectionSummary = summary
+            let bytes = await size.value
+            guard !Task.isCancelled else { return }
+            selectionSize = bytes
+        }
+    }
+
+    func relativePath(_ url: URL) -> String { drive?.relativePath(of: url) ?? url.path }
+
+    func originalStatus(_ url: URL) -> OriginalLocator.Status {
+        locator.status(ofPlayerPath: relativePath(url))
+    }
+
+    /// Why the selection can't be deleted, or nil if it can.
+    var deleteBlocker: String? {
+        guard let drive, !selection.isEmpty else { return "Nothing selected" }
+        do {
+            try drive.checkDeletable(Array(selection))
+            return nil
+        } catch {
+            return PlayerModel.message(for: error)
+        }
+    }
+
+    /// Step 1: count exactly what would go, then ask for confirmation.
+    func requestDelete() async {
+        guard let drive, deleteBlocker == nil else { return }
+        let urls = selection.sorted { $0.path < $1.path }
+        let summary = await Task.detached { drive.count(urls) }.value
+        pendingDeletion = PendingDeletion(urls: urls, names: urls.map(\.lastPathComponent),
+                                          summary: summary, size: selectionSize,
+                                          onlyCopyWarning: onlyCopyWarning(for: urls))
+    }
+
+    func cancelDelete() { pendingDeletion = nil }
+
+    /// Warns when the player may hold the only copy: items from another computer, or from
+    /// this Mac but no longer here.
+    func onlyCopyWarning(for urls: [URL]) -> String? {
+        var others = Set<String>(), missing = 0
+        for url in urls {
+            switch originalStatus(url) {
+            case .otherComputer(let name): others.insert(name)
+            case .missing: missing += 1
+            case .onThisMac, .unknown: break
+            }
+        }
+        var parts: [String] = []
+        if !others.isEmpty {
+            parts.append("Came from \(others.sorted().joined(separator: ", ")), not this Mac: the player may have the only copy.")
+        }
+        if missing > 0 {
+            parts.append("\(missing == 1 ? "1 item's" : "\(missing) items'") original is no longer on this Mac.")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " ") + " Make sure you have another copy, or don't need it."
+    }
+
+    /// Step 2: only after the user confirmed in the dialog. The dialog hands over exactly what
+    /// it showed (closing the dialog clears `pendingDeletion` before this runs).
+    /// Deletes file by file (~1 per second on the player) with progress; `stopDeleting()` stops it.
+    func confirmDelete(_ pending: PendingDeletion) async {
+        guard let drive else { return }
+        pendingDeletion = nil
+        isDeleting = true
+        deletedFiles = 0
+        filesToDelete = pending.summary.files
+        lastResult = nil
+        let task = Task.detached {
+            try drive.delete(pending.urls) { removed in
+                Task { @MainActor [weak self] in self?.deletedFiles = max(self?.deletedFiles ?? 0, removed) }
+            }
+        }
+        deleteTask = task
+        let what = pending.names.count == 1 ? "“\(pending.names[0])”" : "\(pending.names.count) items"
+        do {
+            try await task.value
+            lastResult = "Deleted \(what) (\(pending.summary.files) files\(pending.size.map { ", " + Self.bytes($0) } ?? "")). "
+                + "The player updates its library by itself; use Refresh Library to see the new lists."
+        } catch is CancellationError {
+            lastResult = "Stopped. \(deletedFiles) of \(filesToDelete) files were deleted; the rest is still on the player."
+        } catch {
+            lastResult = "Deletion stopped: \(PlayerModel.message(for: error)). \(deletedFiles) files were deleted; the list shows what's left."
+        }
+        deleteTask = nil
+        isDeleting = false
+        reload()
+    }
+
+    // MARK: Deleting tracks from anywhere (library pages)
+
+    struct PendingTrackDeletion {
+        let tracks: [Track]
+        let urls: [URL]
+        /// Tracks whose file couldn't be located (not deleted).
+        let unlocated: [Track]
+        let onlyCopyWarning: String?
+    }
+
+    private(set) var pendingTrackDeletion: PendingTrackDeletion?
+    private(set) var isPreparingTrackDeletion = false
+
+    /// Connects to the drive if the Drive page hasn't yet (by name, then address).
+    func ensureConnected(_ player: PlayerModel) async {
+        self.player = player
+        guard drive == nil, let device = player.device else { return }
+        await connect(hosts: [device.friendlyName, device.host])
+    }
+
+    /// Step 1: find the tracks' files and ask for confirmation.
+    func requestDeletion(of tracks: [Track], player: PlayerModel) async {
+        guard !tracks.isEmpty, !isDeleting, !isUploading else { return }
+        isPreparingTrackDeletion = true
+        defer { isPreparingTrackDeletion = false }
+        await ensureConnected(player)
+        if tracks.contains(where: { player.trackPaths[$0.trackid] == nil }) { await player.loadTrackPaths() }
+        guard let drive else {
+            lastResult = "Couldn't connect to the player's drive, so nothing was deleted."
+            return
+        }
+        var urls: [URL] = [], unlocated: [Track] = []
+        for track in tracks {
+            if let path = player.trackPaths[track.trackid] {
+                urls.append(drive.root.appendingPathComponent(path))
+            } else {
+                unlocated.append(track)
+            }
+        }
+        guard !urls.isEmpty else {
+            lastResult = "Couldn't find the files for these tracks on the drive, so nothing was deleted."
+            return
+        }
+        pendingTrackDeletion = PendingTrackDeletion(tracks: tracks.filter { player.trackPaths[$0.trackid] != nil },
+                                                    urls: urls, unlocated: unlocated,
+                                                    onlyCopyWarning: onlyCopyWarning(for: urls))
+    }
+
+    func cancelTrackDeletion() { pendingTrackDeletion = nil }
+
+    /// Step 2: only after the user confirmed.
+    func confirmTrackDeletion(_ pending: PendingTrackDeletion) async {
+        guard let drive else { return }
+        pendingTrackDeletion = nil
+        isDeleting = true
+        deletedFiles = 0
+        filesToDelete = pending.urls.count
+        lastResult = nil
+        let task = Task.detached {
+            try drive.delete(pending.urls) { removed in
+                Task { @MainActor [weak self] in self?.deletedFiles = max(self?.deletedFiles ?? 0, removed) }
+            }
+        }
+        deleteTask = task
+        var removedIDs = Set<Int>()
+        do {
+            try await task.value
+            removedIDs = Set(pending.tracks.map(\.trackid))
+            lastResult = "Deleted \(countText(pending.tracks.count, "track")) from the player."
+                + (pending.unlocated.isEmpty ? "" : " \(countText(pending.unlocated.count, "track")) couldn't be found on the drive and were left alone.")
+        } catch {
+            // Work out which files are really gone.
+            for (track, url) in zip(pending.tracks, pending.urls) where !FileManager.default.fileExists(atPath: url.path) {
+                removedIDs.insert(track.trackid)
+            }
+            lastResult = (error is CancellationError ? "Stopped. " : "Deleting stopped: \(PlayerModel.message(for: error)). ")
+                + "\(countText(removedIDs.count, "track")) of \(pending.tracks.count) were deleted."
+        }
+        deleteTask = nil
+        isDeleting = false
+        player?.forget(trackIDs: removedIDs)
+        if folder != nil { reload() }
+    }
+
+    // MARK: Tidying up Mac leftovers
+
+    struct PendingTidy {
+        let urls: [URL]
+        let folderName: String
+    }
+
+    /// Set after counting; the confirmation dialog shows it.
+    private(set) var pendingTidy: PendingTidy?
+    private(set) var isScanningLeftovers = false
+
+    /// Step 1: count the Mac leftovers in the current folder and everything inside it.
+    func requestTidy() async {
+        guard let drive, let folder, !isUploading, !isDeleting else { return }
+        isScanningLeftovers = true
+        defer { isScanningLeftovers = false }
+        let found = await Task.detached { drive.macLeftovers(in: folder) }.value
+        if found.isEmpty {
+            lastResult = "No Mac leftovers here: nothing to tidy."
+        } else {
+            pendingTidy = PendingTidy(urls: found, folderName: breadcrumbs.last?.name ?? "this folder")
+        }
+    }
+
+    func cancelTidy() { pendingTidy = nil }
+
+    /// Step 2: only after the user confirmed.
+    func confirmTidy(_ pending: PendingTidy) async {
+        guard let drive else { return }
+        pendingTidy = nil
+        isDeleting = true
+        deletedFiles = 0
+        filesToDelete = pending.urls.count
+        lastResult = nil
+        let task = Task.detached {
+            try drive.delete(pending.urls) { removed in
+                Task { @MainActor [weak self] in self?.deletedFiles = max(self?.deletedFiles ?? 0, removed) }
+            }
+        }
+        deleteTask = task
+        do {
+            try await task.value
+            lastResult = "Tidied up: removed \(pending.urls.count) Mac leftover file\(pending.urls.count == 1 ? "" : "s"). No music was touched."
+        } catch is CancellationError {
+            lastResult = "Stopped. \(deletedFiles) of \(filesToDelete) leftover files were removed."
+        } catch {
+            lastResult = "Tidying stopped: \(PlayerModel.message(for: error)). \(deletedFiles) leftover files were removed."
+        }
+        deleteTask = nil
+        isDeleting = false
+        reload()
+    }
+
+    /// Stops a running deletion after the current file. What's already deleted stays deleted.
+    func stopDeleting() { deleteTask?.cancel() }
+
+    func dismissResult() { lastResult = nil }
+
+    static func bytes(_ count: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
+    }
+}
+
+/// Passes on progress at most every 4 MB (and at each new file), so the screen isn't flooded.
+final class ProgressThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastBytes: Int64 = -1
+    private var lastFiles = -1
+
+    func shouldReport(_ progress: UploadProgress) -> Bool {
+        lock.withLock {
+            if progress.filesDone != lastFiles || progress.bytesDone - lastBytes >= 4 << 20 || lastBytes < 0 {
+                lastFiles = progress.filesDone
+                lastBytes = progress.bytesDone
+                return true
+            }
+            return false
+        }
+    }
+}
+
+/// BACK and the FOLDERS switch on the amp move through the drive's folders.
+extension DriveModel: DriveNavigation {
+    var folderDepth: Int { max(breadcrumbs.count - 1, 0) }
+    func goUpFolder() { if let parent = breadcrumbs.dropLast().last { open(parent.url) } }
+    func goToTopFolder() { if let top = breadcrumbs.first { open(top.url) } }
+}

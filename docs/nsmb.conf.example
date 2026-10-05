@@ -1,0 +1,16 @@
+# ~/Library/Preferences/nsmb.conf — Mac-side SMB settings for the Sony HAP-Z1ES.
+#
+# The player's SMB2 hangs on writes (it runs out of "credits", drops the connection and can
+# lose data), and newer SMB 3.1.1 greetings make it hang up. SMB1 works (Sony's own transfer app
+# used it). "soft" makes stuck requests fail after a timeout instead of hanging forever.
+# Only the player is affected; everything else keeps the Mac's normal settings.
+#
+# Use the player's name as the app shows it, and/or its network address.
+
+[HAP-Z1ES]
+protocol_vers_map=1
+soft=yes
+
+# [192.168.1.50]
+# protocol_vers_map=1
+# soft=yes
