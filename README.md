@@ -9,6 +9,8 @@ apps no longer get updates.
 **[⬇ Download HAP Player 1.0 for Mac](https://github.com/robertkukulis-ops/hap-player/releases/latest)**
 · universal (Apple silicon and Intel) · macOS 15 or later
 
+![HAP Player on a Mac: the album covers of a HAP-Z1ES library on a big blue screen in a silver hi-fi player front, with the section buttons on an amplifier below](docs/screenshot.png)
+
 Not made, endorsed or supported by Sony. Sony, HAP-Z1ES and other names are trademarks of their
 owners.
 
