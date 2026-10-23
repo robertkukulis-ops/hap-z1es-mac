@@ -1,8 +1,13 @@
-# HAP Player
+# HAP Player — Mac app for the Sony HAP-Z1ES (and HAP-S1) HDD audio player
 
-An unofficial Mac app for the **Sony HAP-Z1ES** HDD audio player: browse your music, play it,
-copy music to the player and tidy up its drive. Made because Sony's own apps (HAP Music
-Transfer, HDD Audio Remote) no longer get updates.
+A free, open-source **replacement for Sony's HAP Music Transfer and HDD Audio Remote** apps, for
+macOS. Browse and search the music on your HAP-Z1ES, play it (play/pause, next, seek, shuffle,
+repeat), make playlists, see album covers, copy music to the player's hard drive by drag and
+drop, split FLAC/WAV + CUE albums into tracks, and tidy up the drive. Made because Sony's own
+apps no longer get updates.
+
+**[⬇ Download HAP Player 1.0 for Mac](https://github.com/robertkukulis-ops/hap-player/releases/latest)**
+· universal (Apple silicon and Intel) · macOS 15 or later
 
 Not made, endorsed or supported by Sony. Sony, HAP-Z1ES and other names are trademarks of their
 owners.
