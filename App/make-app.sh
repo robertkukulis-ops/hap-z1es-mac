@@ -19,8 +19,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>app.hap-player.HAP</string>
     <key>CFBundleExecutable</key><string>HAP</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.4</string>
-    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>6</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>

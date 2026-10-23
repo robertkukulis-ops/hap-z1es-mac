@@ -5,11 +5,12 @@ import SwiftUI
 
 /// Finds and keeps album covers the player doesn't have, and artist pictures.
 ///
-/// Order for an album without a cover on the player: Apple's iTunes catalogue, Deezer,
-/// MusicBrainz/Cover Art Archive; then a picture of the artist (Deezer); otherwise the app
-/// draws a generated tile. Found pictures are saved on the Mac in
-/// ~/Library/Caches/HAPKit/covers and shown in the app only: the music files are not changed.
-/// Only album and artist names are sent to those services.
+/// Order for an album without a cover on the player: the picture from the Mac folder it was
+/// copied from (cover.jpg, …); Apple's iTunes catalogue, Deezer, MusicBrainz/Cover Art Archive;
+/// then a picture of the artist (Deezer); otherwise the app draws a generated tile. Pictures
+/// are saved on the Mac in ~/Library/Caches/HAPKit/covers and shown in the app only: the music
+/// files are not changed. Only album and artist names are sent to those services. Missing
+/// covers are looked up by themselves after each library refresh.
 @MainActor @Observable
 final class CoverArtStore {
     struct Entry: Codable {
@@ -17,6 +18,8 @@ final class CoverArtStore {
         var source: String?     // where it came from (a web address)
         var rejected: [String] = []
         var checked = Date()
+        /// A kept folder picture waiting for its songs: their paths inside the drive (lowercased).
+        var songs: [String]?
     }
 
     private(set) var entries: [String: Entry] = [:]
@@ -27,11 +30,11 @@ final class CoverArtStore {
     @ObservationIgnored private let folder: URL
     @ObservationIgnored private var searchTask: Task<Void, Never>?
 
-    init() {
-        folder = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    init(folder: URL? = nil) {
+        self.folder = folder ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("HAPKit/covers", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        if let data = try? Data(contentsOf: folder.appendingPathComponent("index.json")),
+        try? FileManager.default.createDirectory(at: self.folder, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: self.folder.appendingPathComponent("index.json")),
            let saved = try? JSONDecoder().decode([String: Entry].self, from: data) {
             entries = saved
         }
@@ -72,15 +75,108 @@ final class CoverArtStore {
         return image(forKey: Self.artistKey(name))
     }
 
+    // MARK: Folder pictures
+
+    nonisolated static let folderPrefix = "folder|"
+    /// Unmatched folder pictures are forgotten after this long (the player adds new music
+    /// within minutes).
+    static let folderPictureLifetime: TimeInterval = 30 * 24 * 3600
+
+    /// After copying music: keeps the picture of each Mac folder it came from (a copy of the
+    /// file, made in the background), with that folder's songs (paths inside the drive). It
+    /// becomes their albums' cover once the player has added the songs (`applyFolderCovers`).
+    func addFolderPictures(_ pictures: [(picture: URL, songs: [String])]) async {
+        let folder = self.folder
+        let copies = await Task.detached {
+            pictures.compactMap { picture, songs -> (key: String, file: String, source: String, songs: [String])? in
+                let key = Self.folderPrefix + picture.path.lowercased()
+                let ext = picture.pathExtension.lowercased()
+                let file = "\(stableHash(key))-\(UUID().uuidString.prefix(6)).\(ext.isEmpty ? "jpg" : ext)"
+                guard (try? FileManager.default.copyItem(at: picture, to: folder.appendingPathComponent(file))) != nil else { return nil }
+                return (key, file, "folder:" + picture.path, songs.map { $0.lowercased() })
+            }
+        }.value
+        guard !copies.isEmpty else { return }
+        for copy in copies {
+            if let old = entries[copy.key] { removeFile(old) }
+            entries[copy.key] = Entry(file: copy.file, source: copy.source, songs: copy.songs)
+        }
+        persist()
+    }
+
+    /// Gives the albums of a kept folder picture's songs that picture as their cover (it
+    /// replaces a cover found online, but not one you rejected). Pictures whose songs aren't in
+    /// the library yet are kept for a later refresh.
+    func applyFolderCovers(albums: [Album], tracks: [Track], trackPaths: [Int: String]) {
+        let pending = entries.filter { $0.key.hasPrefix(Self.folderPrefix) }
+        guard !pending.isEmpty else { return }
+        let albumsByID = Dictionary(albums.map { ($0.albumid, $0) }, uniquingKeysWith: { a, _ in a })
+        var albumAtPath: [String: Album] = [:]
+        for track in tracks {
+            guard let path = trackPaths[track.trackid], let id = track.album?.albumid, let album = albumsByID[id] else { continue }
+            albumAtPath[path.lowercased()] = album
+        }
+        var changed = false
+        for (key, entry) in pending {
+            guard let file = entry.file, let songs = entry.songs else { entries[key] = nil; changed = true; continue }
+            var matched: [Album] = []
+            for album in songs.compactMap({ albumAtPath[$0] }) where !album.name.isEmpty && !matched.contains(where: { $0.albumid == album.albumid }) {
+                matched.append(album)
+            }
+            if matched.isEmpty {
+                if Date().timeIntervalSince(entry.checked) > Self.folderPictureLifetime {
+                    removeFile(entry)
+                    entries[key] = nil
+                    changed = true
+                }
+                continue
+            }
+            changed = true
+            for album in matched {
+                let albumKey = Self.albumKey(album)
+                let copy = "\(stableHash(albumKey))-\(UUID().uuidString.prefix(6)).\((file as NSString).pathExtension)"
+                guard (try? FileManager.default.copyItem(at: folder.appendingPathComponent(file),
+                                                         to: folder.appendingPathComponent(copy))) != nil else { continue }
+                var albumEntry = entries[albumKey] ?? Entry()
+                if let source = entry.source, albumEntry.rejected.contains(source) { continue }
+                removeFile(albumEntry)
+                albumEntry.file = copy
+                albumEntry.source = entry.source
+                albumEntry.checked = Date()
+                entries[albumKey] = albumEntry
+                images[albumKey] = nil
+            }
+            removeFile(entry)
+            entries[key] = nil
+        }
+        if changed { persist() }
+    }
+
+    /// After each library refresh: folder pictures first, then a quiet online look-up of
+    /// covers and artist pictures not checked before.
+    func libraryLoaded(albums: [Album], artists: [String], tracks: [Track], trackPaths: [Int: String]) {
+        applyFolderCovers(albums: albums, tracks: tracks, trackPaths: trackPaths)
+        findMissing(albums: albums, artists: artists, automatic: true)
+    }
+
     // MARK: Finding
 
     /// Looks up everything that's missing: covers for albums the player has no cover for, and
     /// pictures for their artists (used when no cover is found, and on the Artists page).
-    func findMissing(albums: [Album], artists: [String]) {
+    /// From the button, albums and artists where nothing was found before are tried again
+    /// (not ones whose cover you removed). `automatic`: new ones, and ones where nothing was
+    /// found a month ago; a summary only if something was found.
+    func findMissing(albums: [Album], artists: [String], automatic: Bool = false) {
         guard !isSearching else { return }
-        let needAlbums = albums.filter { $0.image == nil && entries[Self.albumKey($0)] == nil && !$0.name.isEmpty }
+        func needed(_ key: String) -> Bool {
+            guard let entry = entries[key] else { return true }
+            guard entry.file == nil && entry.rejected.isEmpty else { return false }
+            return !automatic || Date().timeIntervalSince(entry.checked) > Self.notFoundRetry
+        }
+        let needAlbums = albums.filter { $0.image == nil && !$0.name.isEmpty && needed(Self.albumKey($0)) }
         let needArtists = Array(Set(artists + albums.filter { $0.image == nil }.compactMap { $0.albumArtist?.name }))
-            .filter { !Self.isUnknown($0) && entries[Self.artistKey($0)] == nil }
+            .filter { !Self.isUnknown($0) && needed(Self.artistKey($0)) }
+        if automatic && needAlbums.isEmpty && needArtists.isEmpty { return }
         isSearching = true
         progress = (0, needAlbums.count + needArtists.count)
         lastSummary = nil
@@ -88,6 +184,8 @@ final class CoverArtStore {
             var foundCovers = 0, foundArtists = 0
             for album in needAlbums {
                 if Task.isCancelled { break }
+                // A folder picture may have arrived meanwhile (it's preferred to online covers).
+                if entries[Self.albumKey(album)]?.file != nil { progress.done += 1; continue }
                 if await findCover(for: album) { foundCovers += 1 }
                 progress.done += 1
             }
@@ -97,11 +195,23 @@ final class CoverArtStore {
                 progress.done += 1
             }
             isSearching = false
-            lastSummary = "Found \(foundCovers) of \(needAlbums.count) missing album covers and \(foundArtists) artist pictures."
+            if !automatic || foundCovers + foundArtists > 0 {
+                lastSummary = "Found \(foundCovers) of \(needAlbums.count) missing album covers and \(foundArtists) artist pictures."
+            }
         }
     }
 
     func stop() { searchTask?.cancel() }
+
+    /// Automatic look-ups try again where nothing was found after this long.
+    static let notFoundRetry: TimeInterval = 30 * 24 * 3600
+
+    /// A folder picture is the album's cover (online look-ups leave it alone).
+    private func hasFolderCover(_ key: String) -> Bool {
+        entries[key]?.file != nil && entries[key]?.source?.hasPrefix("folder:") == true
+    }
+
+    func clearSummary() { lastSummary = nil }
 
     /// Finds a cover for one album; skips pictures you rejected. True if one was found.
     @discardableResult
@@ -109,10 +219,14 @@ final class CoverArtStore {
         let key = Self.albumKey(album)
         let rejected = entries[key]?.rejected ?? []
         let artist = album.albumArtist?.name ?? ""
-        for candidate in await Self.coverCandidates(album: album.name, artist: Self.isUnknown(artist) ? "" : artist)
-        where !rejected.contains(candidate) {
+        // nil: no service answered (offline, or busy); nothing is recorded, so it's tried again.
+        guard let candidates = await Self.coverCandidates(album: album.name, artist: Self.isUnknown(artist) ? "" : artist)
+        else { return false }
+        for candidate in candidates where !rejected.contains(candidate) {
+            if hasFolderCover(key) { return true }  // arrived while looking
             if await save(candidate, key: key) { return true }
         }
+        if hasFolderCover(key) { return true }
         entries[key] = Entry(file: nil, source: nil, rejected: rejected)
         persist()
         return false
@@ -122,7 +236,8 @@ final class CoverArtStore {
     func findArtistPicture(_ name: String) async -> Bool {
         let key = Self.artistKey(name)
         let rejected = entries[key]?.rejected ?? []
-        for candidate in await Self.artistCandidates(name) where !rejected.contains(candidate) {
+        guard let candidates = await Self.artistCandidates(name) else { return false }  // no answer: try again later
+        for candidate in candidates where !rejected.contains(candidate) {
             if await save(candidate, key: key) { return true }
         }
         entries[key] = Entry(file: nil, source: nil, rejected: rejected)
@@ -166,6 +281,7 @@ final class CoverArtStore {
               let (data, response) = try? await URLSession.shared.data(for: Self.request(url)),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let image = NSImage(data: data), image.size.width >= 100 else { return false }
+        if hasFolderCover(key) { return true }  // a folder picture arrived while downloading
         let file = "\(stableHash(key))-\(UUID().uuidString.prefix(6)).jpg"
         guard (try? data.write(to: folder.appendingPathComponent(file))) != nil else { return false }
         var entry = entries[key] ?? Entry()
@@ -193,8 +309,10 @@ final class CoverArtStore {
         return request
     }
 
+    /// nil if the service couldn't be reached or didn't answer normally.
     static func json(_ url: URL?) async -> [String: Any]? {
-        guard let url, let (data, _) = try? await URLSession.shared.data(for: request(url)) else { return nil }
+        guard let url, let (data, response) = try? await URLSession.shared.data(for: request(url)),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
@@ -209,14 +327,20 @@ final class CoverArtStore {
             || normalized(found ?? "").contains(normalized(wanted)) || normalized(wanted).contains(normalized(found ?? "#"))
     }
 
-    /// Picture addresses for an album, best first.
-    static func coverCandidates(album: String, artist: String) async -> [String] {
+    /// Picture addresses for an album, best first; nil if none of the services answered.
+    static func coverCandidates(album: String, artist: String) async -> [String]? {
         var results: [String] = []
+        var answered = false
+        func ask(_ url: URL?) async -> [String: Any]? {
+            let answer = await json(url)
+            if answer != nil { answered = true }
+            return answer
+        }
         // 1. Apple's iTunes catalogue.
         var itunes = URLComponents(string: "https://itunes.apple.com/search")!
         itunes.queryItems = [URLQueryItem(name: "term", value: "\(artist) \(normalized(album))"),
                              URLQueryItem(name: "entity", value: "album"), URLQueryItem(name: "limit", value: "10")]
-        for item in (await json(itunes.url)?["results"] as? [[String: Any]]) ?? []
+        for item in (await ask(itunes.url)?["results"] as? [[String: Any]]) ?? []
         where matches(item["collectionName"] as? String, album) && artistMatches(item["artistName"] as? String, artist) {
             if let art = item["artworkUrl100"] as? String {
                 results.append(art.replacingOccurrences(of: "100x100bb", with: "600x600bb"))
@@ -225,7 +349,7 @@ final class CoverArtStore {
         // 2. Deezer.
         var deezer = URLComponents(string: "https://api.deezer.com/search/album")!
         deezer.queryItems = [URLQueryItem(name: "q", value: artist.isEmpty ? "album:\"\(album)\"" : "artist:\"\(artist)\" album:\"\(album)\"")]
-        for item in (await json(deezer.url)?["data"] as? [[String: Any]]) ?? []
+        for item in (await ask(deezer.url)?["data"] as? [[String: Any]]) ?? []
         where matches(item["title"] as? String, album)
             && artistMatches((item["artist"] as? [String: Any])?["name"] as? String, artist) {
             if let art = item["cover_xl"] as? String { results.append(art) }
@@ -235,19 +359,21 @@ final class CoverArtStore {
         let q = artist.isEmpty ? "release:\"\(album)\"" : "release:\"\(album)\" AND artist:\"\(artist)\""
         mb.queryItems = [URLQueryItem(name: "query", value: q), URLQueryItem(name: "fmt", value: "json"),
                          URLQueryItem(name: "limit", value: "5")]
-        for release in (await json(mb.url)?["releases"] as? [[String: Any]]) ?? []
+        for release in (await ask(mb.url)?["releases"] as? [[String: Any]]) ?? []
         where (release["score"] as? Int ?? 0) >= 90 {
             if let id = release["id"] as? String { results.append("https://coverartarchive.org/release/\(id)/front-500") }
         }
+        guard answered else { return nil }
         var seen = Set<String>()
         return results.filter { seen.insert($0).inserted }
     }
 
-    /// Picture addresses for an artist (Deezer), best first.
-    static func artistCandidates(_ name: String) async -> [String] {
+    /// Picture addresses for an artist (Deezer), best first; nil if Deezer didn't answer.
+    static func artistCandidates(_ name: String) async -> [String]? {
         var deezer = URLComponents(string: "https://api.deezer.com/search/artist")!
         deezer.queryItems = [URLQueryItem(name: "q", value: name)]
-        return ((await json(deezer.url)?["data"] as? [[String: Any]]) ?? [])
+        guard let answer = await json(deezer.url) else { return nil }
+        return ((answer["data"] as? [[String: Any]]) ?? [])
             .filter { matches($0["name"] as? String, name) }
             .compactMap { $0["picture_xl"] as? String }
             .filter { !$0.contains("/artist//") }  // Deezer's "no picture" placeholder
@@ -256,8 +382,8 @@ final class CoverArtStore {
 
 // MARK: - Showing artwork
 
-/// Album artwork: the player's cover, else a found cover, else the artist's picture, else a
-/// generated tile.
+/// Album artwork: the player's cover, else the folder picture or a cover found online, else
+/// the artist's picture, else a generated tile.
 struct ArtworkView: View {
     @Environment(PlayerModel.self) private var player
     @Environment(CoverArtStore.self) private var covers

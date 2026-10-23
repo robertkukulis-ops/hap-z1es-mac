@@ -14,6 +14,12 @@ struct RackScreen: View {
             HStack {
                 Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
                 Spacer()
+                if rack.mode == .section, rack.search.isEmpty, [.albums, .artists].contains(rack.section) {
+                    FindCoversButton()
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(ScreenTheme.dim)
+                        .padding(.trailing, 8)
+                }
                 TextField("Search albums, artists, tracks", text: $rack.search)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 260)

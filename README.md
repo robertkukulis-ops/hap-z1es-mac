@@ -10,11 +10,17 @@ owners.
 ## What it does
 
 - **Browse** albums (with covers), artists, genres, tracks, and the player's folders; search.
+- **Covers** for albums the player has none for: the picture from the album's folder on your
+  Mac (cover.jpg, folder.jpg, …) when you copy it, otherwise looked up online by itself after
+  each library refresh (or with **Find Missing Covers**). Shown in the app only.
 - **Play** on the player: play/pause, next/previous, jump within a track, play whole albums,
   folders and playlists (the app plays them song by song), shuffle and repeat.
 - **Playlists** of your own, kept on the Mac: hand-picked, or automatic (by year, quality,
   plays, newest additions, genres, artists). Export as .m3u.
 - **Copy music** to the player by drag and drop, checked file by file.
+- **Albums in one file + .cue** (FLAC or WAV) are split into one FLAC per song, losslessly,
+  checked sample by sample before copying, with tags from the .cue and the album's cover built
+  in. Albums like this already on the player can be split there too.
 - **Delete** songs, albums or folders from the player (asks first), and **tidy up** the hidden
   files a Mac leaves behind.
 - **Artists** with "feat." guests appear on the guest's page too; spelling variants are merged.

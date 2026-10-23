@@ -92,6 +92,10 @@ struct RackView: View {
                     .padding(.horizontal, 14).padding(.vertical, 8)
                     .background(.regularMaterial, in: Capsule())
                     .padding(.top, 8)
+                    .task(id: summary) {
+                        try? await Task.sleep(for: .seconds(8))
+                        if covers.lastSummary == summary { covers.clearSummary() }
+                    }
             }
         }
     }

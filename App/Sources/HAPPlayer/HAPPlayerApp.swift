@@ -20,7 +20,15 @@ struct HAPPlayerApp: App {
                 .environment(rack)
                 .environment(playlists)
                 .frame(minWidth: 1100, minHeight: 700)
-                .task { await model.connect() }
+                .task {
+                    drive.covers = covers
+                    await model.connect()
+                }
+                .onChange(of: model.libraryLoads) {
+                    guard let library = model.library else { return }
+                    covers.libraryLoaded(albums: library.albums, artists: library.artists.map(\.name),
+                                         tracks: library.tracks, trackPaths: model.trackPaths)
+                }
         }
         .defaultSize(width: 1280, height: 820)
         .commands {
@@ -45,6 +53,11 @@ struct HAPPlayerApp: App {
                 Divider()
                 Button("Refresh Library") { Task { await model.refreshLibrary() } }
                     .keyboardShortcut("r", modifiers: [.command])
+                Button("Find Missing Covers") {
+                    covers.findMissing(albums: model.library?.albums ?? [],
+                                       artists: (model.library?.artists ?? []).map(\.name))
+                }
+                .disabled(covers.isSearching || model.library == nil)
             }
         }
     }

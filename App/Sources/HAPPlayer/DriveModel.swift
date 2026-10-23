@@ -39,6 +39,8 @@ final class DriveModel {
         let size: Int64?
         /// Set when some items didn't come from this Mac, or their originals are gone.
         let onlyCopyWarning: String?
+        /// Shown first (e.g. after splitting a .cue album: the songs passed the check).
+        var note: String? = nil
     }
 
     @ObservationIgnored let locator = OriginalLocator()
@@ -55,6 +57,12 @@ final class DriveModel {
     private(set) var uploadProgress = UploadProgress()
     private(set) var uploadTotalFiles = 0
     private(set) var uploadTotalBytes: Int64 = 0
+    /// While a .cue album is being split on the Mac before copying: "Splitting “Live”… 3 of 12".
+    private(set) var splitStatus: String?
+    /// .cue albums in the open folder (whole albums in one file), found after it's listed.
+    private(set) var cueAlbums: [CueAlbum] = []
+    /// Waiting for "Split into songs" to be confirmed.
+    private(set) var pendingSplit: CueAlbum?
     @ObservationIgnored private var uploadTask: Task<Void, Error>?
 
     /// Why the current folder can't take a drop, or nil if it can.
@@ -77,8 +85,10 @@ final class DriveModel {
             let plan = try await Task.detached {
                 try drive.planUpload(urls, into: folder, allowedExtensions: extensions)
             }.value
-            if plan.items.isEmpty {
+            if plan.items.isEmpty && plan.albumsToSplit.isEmpty {
+                let pictures = await keepFolderPictures(plan)
                 lastResult = "Nothing to copy." + Self.skipSummary(plan.skipped)
+                    + (pictures == 0 ? "" : " The picture from \(pictures) album folder\(pictures == 1 ? " is" : "s are") now the cover in the app.")
             } else {
                 pendingUpload = plan
             }
@@ -90,10 +100,51 @@ final class DriveModel {
     func cancelUpload() { pendingUpload = nil }
 
     /// Step 2: only after the user confirmed. Copies with progress; `stopUploading()` stops it.
-    func confirmUpload(_ plan: UploadPlan) async {
+    func confirmUpload(_ original: UploadPlan) async {
         guard let drive, !hosts.isEmpty else { return }
         pendingUpload = nil
         isUploading = true
+        let pictures = await keepFolderPictures(original)
+        // .cue albums: split on the Mac first (into a temporary folder), then their songs are
+        // copied like any other file. The Mac's own files are never changed.
+        var plan = original
+        var splitNotes: [String] = []
+        cancelFlag = CancelFlag()
+        let temporary = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HAPKit/split/\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        for (number, split) in original.albumsToSplit.enumerated() {
+            let name = split.album.sheet.title ?? split.album.audio.deletingPathExtension().lastPathComponent
+            splitStatus = "Splitting “\(name)”…"
+            do {
+                let folder = temporary.appendingPathComponent("\(number)", isDirectory: true)
+                let album = split.album
+                let flag = cancelFlag
+                let songs = try await Task.detached {
+                    let songs = try AlbumSplitter.split(album, into: folder, progress: { done, total in
+                        Task { @MainActor [weak self] in self?.splitStatus = "Splitting “\(name)”… \(done) of \(total)" }
+                    }, isCancelled: { flag.isSet })
+                    // The exact check before anything is copied: the songs together = the original.
+                    guard try AlbumSplitter.verify(songs: songs, against: album.audio, isCancelled: { flag.isSet }) else {
+                        throw AlbumSplitter.SplitError.writeFailed("the songs of “\(name)” (they didn't match the original)")
+                    }
+                    return songs
+                }.value
+                let taken = Set(plan.items.map { $0.destination.path.lowercased() })
+                let songPlan = drive.plan(songs: songs, into: split.destinationFolder, taken: taken)
+                plan.items += songPlan.items
+                plan.skipped += songPlan.skipped
+                splitNotes.append("Split “\(name)” into \(songs.count) songs.")
+            } catch {
+                splitStatus = nil
+                isUploading = false
+                lastResult = error is CancellationError
+                    ? "Stopped. Nothing was copied."
+                    : "Splitting “\(name)” failed: \(PlayerModel.message(for: error)) Nothing was copied."
+                return
+            }
+        }
+        splitStatus = nil
         uploadProgress = UploadProgress()
         uploadTotalFiles = plan.items.count
         uploadTotalBytes = plan.totalBytes
@@ -122,9 +173,11 @@ final class DriveModel {
             let leftovers = session.leftoverTemporaryFiles > 0
                 ? " \(session.leftoverTemporaryFiles) hidden temporary file\(session.leftoverTemporaryFiles == 1 ? "" : "s") couldn't be removed yet; the next upload into this folder cleans \(session.leftoverTemporaryFiles == 1 ? "it" : "them") up."
                 : ""
-            lastResult = "Copied \(plan.items.count) file\(plan.items.count == 1 ? "" : "s") (\(Self.bytes(plan.totalBytes))) to the player\(recovered)."
+            lastResult = (splitNotes.isEmpty ? "" : splitNotes.joined(separator: " ") + " ")
+                + "Copied \(plan.items.count) file\(plan.items.count == 1 ? "" : "s") (\(Self.bytes(plan.totalBytes))) to the player\(recovered)."
                 + Self.skipSummary(plan.skipped) + leftovers
                 + " The player adds new music to its library by itself; use Refresh Library to see it."
+                + (pictures == 0 ? "" : " Album folder pictures become the covers in the app once the songs are in the library.")
         } catch is CancellationError {
             lastResult = "Stopped. \(uploadProgress.filesDone) of \(plan.items.count) files were copied. Drop the same files again to continue: complete ones are skipped."
         } catch {
@@ -136,7 +189,94 @@ final class DriveModel {
         reload()
     }
 
-    func stopUploading() { uploadTask?.cancel() }
+    /// Stop: cancels a copy, and splitting or checking a .cue album.
+    func stopUploading() {
+        uploadTask?.cancel()
+        cancelFlag.set()
+    }
+
+    /// Checked while splitting and checking (which run outside Swift tasks' cancellation).
+    @ObservationIgnored private var cancelFlag = CancelFlag()
+
+    // MARK: Splitting a .cue album that's already on the player
+
+    func requestSplit(_ album: CueAlbum) { pendingSplit = album }
+    func cancelSplit() { pendingSplit = nil }
+
+    /// Reads the big file from the player, splits it on the Mac, copies the songs back into the
+    /// same folder (the safe upload), checks them against the original, and then offers to
+    /// delete the original (and its .cue) with the usual confirmation. Never deletes by itself.
+    func confirmSplit(_ album: CueAlbum) async {
+        guard let drive, !hosts.isEmpty, !isUploading else { return }
+        pendingSplit = nil
+        isUploading = true
+        lastResult = nil
+        let name = album.sheet.title ?? album.audio.deletingPathExtension().lastPathComponent
+        let audioPath = drive.relativePath(of: album.audio), cuePath = drive.relativePath(of: album.cue)
+        cancelFlag = CancelFlag()
+        let flag = cancelFlag
+        let temporary = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HAPKit/split/\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: temporary)
+            splitStatus = nil
+            isUploading = false
+            reload()
+        }
+        do {
+            splitStatus = "Reading “\(name)” from the player and splitting it…"
+            let songs = try await Task.detached {
+                try AlbumSplitter.split(album, into: temporary, progress: { done, total in
+                    Task { @MainActor [weak self] in self?.splitStatus = "Splitting “\(name)”… \(done) of \(total)" }
+                }, isCancelled: { flag.isSet })
+            }.value
+            let plan = drive.plan(songs: songs, into: album.audio.deletingLastPathComponent())
+            guard plan.skipped.isEmpty else {
+                lastResult = "Songs with these names are already in this folder, so nothing was copied or deleted."
+                return
+            }
+            splitStatus = nil
+            uploadProgress = UploadProgress()
+            uploadTotalFiles = plan.items.count
+            uploadTotalBytes = plan.totalBytes
+            let throttle = ProgressThrottle()
+            let session = UploadSession(hosts: hosts, drive: drive)
+            let upload = Task.detached {
+                try session.upload(plan) { progress in
+                    guard throttle.shouldReport(progress) else { return }
+                    Task { @MainActor [weak self] in self?.uploadProgress = progress }
+                }
+            }
+            uploadTask = upload  // so Stop works
+            defer { uploadTask = nil }
+            try await upload.value
+            // The drive may now be connected at a different folder on the Mac.
+            let fresh = session.drive
+            self.drive = fresh
+            folder = fresh.root.appendingPathComponent(drive.relativePath(of: album.audio.deletingLastPathComponent()))
+            splitStatus = "Checking the songs against the original…"
+            let onPlayer = plan.items.map { fresh.root.appendingPathComponent(drive.relativePath(of: $0.destination)) }
+            let original = fresh.root.appendingPathComponent(audioPath)
+            let verified = try await Task.detached { try AlbumSplitter.verify(songs: onPlayer, against: original, isCancelled: { flag.isSet }) }.value
+            let arrived = onPlayer.filter { FileManager.default.fileExists(atPath: $0.path) }.count
+            switch CueSplitJob.outcome(verified: verified, uploaded: arrived, expected: songs.count) {
+            case .failed(let problem):
+                lastResult = "Split “\(name)” into \(songs.count) songs, but \(problem)"
+            case .askToDeleteOriginal:
+                let urls = [original, fresh.root.appendingPathComponent(cuePath)]
+                let summary = await Task.detached { fresh.count(urls) }.value
+                pendingDeletion = PendingDeletion(
+                    urls: urls, names: urls.map(\.lastPathComponent), summary: summary, size: nil,
+                    onlyCopyWarning: onlyCopyWarning(for: urls),
+                    note: "The \(songs.count) songs of “\(name)” are now in this folder, and together they're identical to the original. "
+                        + "You can delete the original big file and its .cue (or cancel to keep them; the album then shows twice in the player's library).")
+            }
+        } catch is CancellationError {
+            lastResult = "Stopped. Nothing was deleted."
+        } catch {
+            lastResult = "Splitting “\(name)” stopped: \(PlayerModel.message(for: error)) Nothing was deleted."
+        }
+    }
 
     /// e.g. " Skipped 3: 2 not music files the player plays, 1 already on the player."
     static func skipSummary(_ skipped: [UploadSkip]) -> String {
@@ -210,6 +350,11 @@ final class DriveModel {
             case .success(let list):
                 items = list
                 listError = nil
+                cueAlbums = []
+                if list.contains(where: { !$0.isFolder && $0.name.lowercased().hasSuffix(".cue") }) {
+                    let found = await Task.detached { CueAlbum.find(in: url) }.value
+                    if loadToken == token { cueAlbums = found }
+                }
                 await loadFolderTracks(for: url, token: token)
             case .failure(let error):
                 items = []
@@ -220,6 +365,22 @@ final class DriveModel {
     }
 
     @ObservationIgnored weak var player: PlayerModel?
+    @ObservationIgnored weak var covers: CoverArtStore?
+
+    /// Keeps the pictures of the dropped album folders (cover.jpg, …) as covers in the app (a
+    /// copy on the Mac; nothing is written to the player). Used at once for songs already in
+    /// the library, otherwise after the player has added them. Returns how many.
+    private func keepFolderPictures(_ plan: UploadPlan) async -> Int {
+        guard let drive, let covers else { return 0 }
+        let found = await Task.detached { plan.folderPictures() }.value  // reads folders: not on the main thread
+        let pictures = found.map { (picture: $0.picture, songs: $0.songs.map { drive.relativePath(of: $0) }) }
+        guard !pictures.isEmpty else { return 0 }
+        await covers.addFolderPictures(pictures)
+        if let player, let library = player.library {
+            covers.applyFolderCovers(albums: library.albums, tracks: library.tracks, trackPaths: player.trackPaths)
+        }
+        return pictures.count
+    }
 
     private func loadFolderTracks(for url: URL, token: UUID) async {
         guard let drive, let client = player?.client,

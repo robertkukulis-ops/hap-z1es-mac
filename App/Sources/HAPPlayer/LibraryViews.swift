@@ -216,7 +216,7 @@ struct FindCoversButton: View {
             } label: {
                 Label("Find Missing Covers", systemImage: "photo.badge.magnifyingglass")
             }
-            .help("Look up covers the player doesn't have (Apple, Deezer, MusicBrainz), and artist pictures. Only names are sent; your music files aren't changed.")
+            .help("Look up covers the player doesn't have (Apple, Deezer, MusicBrainz), and artist pictures. This also happens by itself after each library refresh; the button tries again the ones not found before. Only names are sent; your music files aren't changed.")
         }
     }
 }

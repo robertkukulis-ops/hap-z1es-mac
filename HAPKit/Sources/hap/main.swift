@@ -27,6 +27,9 @@ let usage = """
       hap playlists          List playlists
       hap tracks ALBUM-ID    Tracks of one album (always asked live)
 
+    Files on this Mac (no player needed):
+      hap split FILE.cue FOLDER   Split a .cue album into FLAC songs in FOLDER, and check them
+
     Without --host (or the HAP_HOST environment variable), hap finds the player itself.
     """
 
@@ -254,6 +257,24 @@ do {
                           track.codec?.bitWidth.map { "\($0)-bit" }].compactMap { $0 }.joined(separator: " ")
             print("\(number) \(track.name) — \(named(track.artist?.name ?? "", "?"))  [\(length), \(format)]  id \(track.trackid)")
         }
+
+    case "split":
+        guard arguments.count == 2 else {
+            print("Usage: hap split FILE.cue FOLDER")
+            exit(2)
+        }
+        let cue = URL(fileURLWithPath: arguments[0])
+        guard let album = CueAlbum.find(in: cue.deletingLastPathComponent()).first(where: { $0.cue.lastPathComponent == cue.lastPathComponent }) else {
+            print("No album found for \(cue.lastPathComponent) (is its audio file next to it?)")
+            exit(1)
+        }
+        let songs = try AlbumSplitter.split(album, into: URL(fileURLWithPath: arguments[1], isDirectory: true)) { done, total in
+            print("  \(done) of \(total)")
+        }
+        for song in songs { print(song.lastPathComponent) }
+        print(try AlbumSplitter.verify(songs: songs, against: album.audio)
+              ? "Check: the songs together are identical to the original."
+              : "Check FAILED: the songs differ from the original.")
 
     default:
         print(usage)

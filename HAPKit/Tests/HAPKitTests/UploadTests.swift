@@ -118,3 +118,87 @@ struct FakeSource {
 }
 
 final class LastProgress: @unchecked Sendable { var value = UploadProgress() }
+
+@Suite struct CueUploadTests {
+    let music: Set<String> = HAPDrive.extensions(fromSupportedTypes: ["*.flac", "*.wav", "*.mp3", "*.m4a"])
+
+    private func source(_ files: [String: String]) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CueUpload-\(UUID().uuidString)")
+        for (path, text) in files {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: url)
+        }
+        return root
+    }
+
+    private func cue(_ file: String) -> String {
+        "TITLE \"Album\"\nFILE \"\(file)\" WAVE\n TRACK 01 AUDIO\n  TITLE \"One\"\n  INDEX 01 00:00:00\n TRACK 02 AUDIO\n  TITLE \"Two\"\n  INDEX 01 01:00:00\n"
+    }
+
+    @Test func cueAlbumIsPlannedForSplitting() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let src = try source(["Live/Album.cue": cue("Album.flac"), "Live/Album.flac": "x", "Live/05 Bonus.flac": "y", "Live/cover.jpg": "z"])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("Live")], into: drive.url("Sample Music"), allowedExtensions: music)
+        #expect(plan.albumsToSplit.count == 1)
+        #expect(plan.albumsToSplit.first.map { drive.drive.relativePath(of: $0.destinationFolder) } == "Sample Music/Live")
+        #expect(plan.items.map(\.destination.lastPathComponent) == ["05 Bonus.flac"])  // not the big file
+        #expect(!plan.skipped.contains { $0.source.lastPathComponent == "Album.cue" })
+        #expect(plan.skipped.contains { $0.source.lastPathComponent == "cover.jpg" })   // as usual: music only
+    }
+
+    @Test func twoCueAlbumsInOneFolderBothSplit() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let src = try source(["Box/A.cue": cue("A.flac"), "Box/A.flac": "x", "Box/B.cue": cue("B.wav"), "Box/B.wav": "y"])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("Box")], into: drive.url("Sample Music"), allowedExtensions: music)
+        #expect(plan.albumsToSplit.map { drive.drive.relativePath(of: $0.destinationFolder) } == ["Sample Music/Box/A", "Sample Music/Box/B"])
+        #expect(plan.items.isEmpty)
+    }
+
+    @Test func unsupportedCueAlbumIsCopiedWhole() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let src = try source(["X/X.cue": cue("X.m4a"), "X/X.m4a": "x"])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("X")], into: drive.url("Sample Music"), allowedExtensions: music)
+        #expect(plan.albumsToSplit.isEmpty)
+        #expect(plan.items.map(\.destination.lastPathComponent) == ["X.m4a"])
+        #expect(plan.skipped.contains { $0.source.lastPathComponent == "X.cue" && $0.reason.contains("copied as one file") })
+    }
+
+    @Test func looseCueAndAudioFilesAreSplitToo() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let src = try source(["Album.cue": cue("Album.flac"), "Album.flac": "x"])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("Album.cue"), src.appendingPathComponent("Album.flac")],
+                                              into: drive.url("Sample Music"), allowedExtensions: music)
+        #expect(plan.albumsToSplit.map { drive.drive.relativePath(of: $0.destinationFolder) } == ["Sample Music"])
+        #expect(plan.items.isEmpty)
+    }
+
+    @Test func songsAlreadyOnThePlayerAreSkipped() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let folder = drive.url("Sample Music")
+        try Data("old".utf8).write(to: folder.appendingPathComponent("01 - One.flac"))
+        let songs = try source(["01 - One.flac": "a", "02 - Two.flac": "b"])
+        let plan = drive.drive.plan(songs: [songs.appendingPathComponent("01 - One.flac"), songs.appendingPathComponent("02 - Two.flac")], into: folder)
+        #expect(plan.items.map(\.destination.lastPathComponent) == ["02 - Two.flac"])
+        #expect(plan.skipped.count == 1)
+    }
+}
+
+extension CueUploadTests {
+    @Test func aCueDroppedNextToItsAlbumOnThePlayerIsCopied() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let folder = drive.url("Sample Music")
+        try Data("big".utf8).write(to: folder.appendingPathComponent("Album.flac"))  // already on the player
+        let src = try source(["Album.cue": cue("Album.flac")])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("Album.cue")], into: folder, allowedExtensions: music)
+        #expect(plan.items.map(\.destination.lastPathComponent) == ["Album.cue"])
+        #expect(plan.albumsToSplit.isEmpty)
+    }
+
+    @Test func aCueWithoutItsAlbumIsStillSkipped() throws {
+        let drive = try FakeDrive(); defer { drive.remove() }
+        let src = try source(["Album.cue": cue("Album.flac")])
+        let plan = try drive.drive.planUpload([src.appendingPathComponent("Album.cue")], into: drive.url("Sample Music"), allowedExtensions: music)
+        #expect(plan.items.isEmpty)
+    }
+}

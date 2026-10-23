@@ -40,7 +40,36 @@ struct DriveView: View {
         return VStack(spacing: 0) {
             pathBar
             Divider()
-            if model.isUploading {
+            ForEach(model.cueAlbums, id: \.cue) { album in
+                // A whole album in one file: offer to split it into songs.
+                HStack(spacing: 10) {
+                    Image(systemName: "scissors").foregroundStyle(.secondary)
+                    if album.supported {
+                        Text("“\(album.audio.lastPathComponent)” holds a whole album in one file (\(album.sheet.tracks.count) songs).")
+                        Spacer()
+                        Button("Split into Songs…") { model.requestSplit(album) }
+                            .disabled(model.isUploading || model.isDeleting)
+                    } else {
+                        Text("“\(album.audio.lastPathComponent)” holds a whole album in one file, but this kind of file (\(album.audio.pathExtension.uppercased())) can't be split.")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                }
+                .font(.callout)
+                .padding(10)
+                .background(.quaternary)
+            }
+            if let status = model.splitStatus {
+                HStack(spacing: 12) {
+                    ProgressView().controlSize(.small)
+                    Text(status).monospacedDigit()
+                    Spacer()
+                    Button("Stop") { model.stopUploading() }
+                        .help("Stop splitting. Nothing on the player is deleted.")
+                }
+                .padding(10)
+                .background(.quaternary)
+            } else if model.isUploading {
                 HStack(spacing: 12) {
                     ProgressView(value: Double(model.uploadProgress.bytesDone), total: Double(max(model.uploadTotalBytes, 1)))
                         .frame(maxWidth: 260)
@@ -188,12 +217,27 @@ struct DriveView: View {
                  + "but nothing of value is lost. At about 1 file per second this can take a while; you can stop it at any time.")
         }
         .confirmationDialog(
+            "Split into songs?",
+            isPresented: Binding(get: { model.pendingSplit != nil }, set: { if !$0 { model.cancelSplit() } }),
+            titleVisibility: .visible,
+            presenting: model.pendingSplit
+        ) { album in
+            Button("Split into \(album.sheet.tracks.count) Songs") { Task { await model.confirmSplit(album) } }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { model.cancelSplit() }
+        } message: { album in
+            let names = album.songNames
+            Text(names.prefix(8).joined(separator: "\n") + (names.count > 8 ? "\n…and \(names.count - 8) more" : "")
+                 + "\n\nThe songs are copied into this folder and checked against the original. Afterwards you're asked "
+                 + "whether to delete the original big file. Please don't play this album meanwhile.")
+        }
+        .confirmationDialog(
             "Copy to the player?",
             isPresented: Binding(get: { model.pendingUpload != nil }, set: { if !$0 { model.cancelUpload() } }),
             titleVisibility: .visible,
             presenting: model.pendingUpload
         ) { plan in
-            Button("Copy \(plan.items.count) File\(plan.items.count == 1 ? "" : "s")") {
+            Button(plan.albumsToSplit.isEmpty ? "Copy \(plan.items.count) File\(plan.items.count == 1 ? "" : "s")" : "Split and Copy") {
                 Task { await model.confirmUpload(plan) }
             }
             .keyboardShortcut(.defaultAction)
@@ -221,8 +265,15 @@ struct DriveView: View {
         let folder = model.breadcrumbs.map(\.name).joined(separator: " › ")
         let shown = plan.items.prefix(5).map { "• \($0.source.lastPathComponent)" }.joined(separator: "\n")
         let more = plan.items.count > 5 ? "\n…and \(plan.items.count - 5) more" : ""
-        return "\(plan.items.count) music file\(plan.items.count == 1 ? "" : "s"), \(DriveModel.bytes(plan.totalBytes)), into:\n\(folder)\n\n"
-            + "\(shown)\(more)\n\nNothing on the player is overwritten; folders keep their structure."
+        // Albums in one file with a .cue: split into songs on the way.
+        let splits = plan.albumsToSplit.map { split in
+            let names = split.album.songNames
+            let list = names.prefix(6).map { "   \($0)" }.joined(separator: "\n") + (names.count > 6 ? "\n   …and \(names.count - 6) more" : "")
+            return "“\(split.album.sheet.title ?? split.album.audio.lastPathComponent)” is one file with a .cue: it will be split into \(names.count) songs:\n\(list)"
+        }.joined(separator: "\n\n")
+        let files = plan.items.isEmpty ? "" : "\(plan.items.count) music file\(plan.items.count == 1 ? "" : "s"), \(DriveModel.bytes(plan.totalBytes)):\n\(shown)\(more)\n\n"
+        return "Into: \(folder)\n\n" + (splits.isEmpty ? "" : splits + "\n\n") + files
+            + "Nothing on the player is overwritten; folders keep their structure."
             + DriveModel.skipSummary(plan.skipped)
     }
 
@@ -230,7 +281,7 @@ struct DriveView: View {
         let shown = pending.names.prefix(5).map { "• \($0)" }.joined(separator: "\n")
         let more = pending.names.count > 5 ? "\n…and \(pending.names.count - 5) more" : ""
         let size = pending.size.map { ", \(DriveModel.bytes($0))," } ?? " (size still being counted)"
-        return "\(shown)\(more)\n\n\(pending.summary.files) files\(size) "
+        return (pending.note.map { "\($0)\n\n" } ?? "") + "\(shown)\(more)\n\n\(pending.summary.files) files\(size) "
             + "will be permanently deleted from the player's drive. This can't be undone: the player has no Trash. "
             + "Nothing on this Mac is touched."
             + (pending.onlyCopyWarning.map { "\n\n⚠️ \($0)" } ?? "")

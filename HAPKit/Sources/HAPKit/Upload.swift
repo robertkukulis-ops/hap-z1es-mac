@@ -20,12 +20,22 @@ public struct UploadItem: Sendable, Equatable, Identifiable {
 public struct UploadSkip: Sendable, Equatable {
     public let source: URL
     public let reason: String
+    /// Where it is on the player, when the same file is already there.
+    public var destination: URL? = nil
+}
+
+/// A `.cue` album that will be split into songs (on the Mac) and the songs copied into
+/// `destinationFolder`, instead of copying the big file.
+public struct PlannedSplit: Sendable, Equatable {
+    public let album: CueAlbum
+    public let destinationFolder: URL
 }
 
 /// What a drop would do: shown to the user before anything is copied.
 public struct UploadPlan: Sendable, Equatable {
     public var items: [UploadItem] = []
     public var skipped: [UploadSkip] = []
+    public var albumsToSplit: [PlannedSplit] = []
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.size } }
 }
 
@@ -85,11 +95,40 @@ extension HAPDrive {
         try checkUploadTarget(folder)
         var plan = UploadPlan()
         var taken = Set<String>()
+        // The .cue and big file of albums that get split (or the .cue of ones that can't be).
+        var excluded = Set<String>()
+
+        /// `.cue` albums among `dir`'s files (only those in `dropped`, if given): supported ones
+        /// are split into `destination` (into a subfolder per album when several share a folder).
+        func findAlbums(in dir: URL, destination: URL, dropped: Set<String>? = nil) {
+            let albums = CueAlbum.find(in: dir).filter { album in
+                dropped.map { $0.contains(album.cue.standardizedFileURL.path) && $0.contains(album.audio.standardizedFileURL.path) } ?? true
+            }
+            let splittable = albums.filter(\.supported)
+            for album in albums {
+                excluded.insert(album.cue.standardizedFileURL.path)
+                if album.supported {
+                    excluded.insert(album.audio.standardizedFileURL.path)
+                    let own = splittable.count > 1
+                        ? destination.appendingPathComponent(Self.safeName(album.cue.deletingPathExtension().lastPathComponent), isDirectory: true)
+                        : destination
+                    plan.albumsToSplit.append(PlannedSplit(album: album, destinationFolder: own))
+                } else {
+                    let kind = album.audio.pathExtension.uppercased()
+                    plan.skipped.append(UploadSkip(source: album.cue, reason: "album in one file that can't be split (\(kind)); copied as one file"))
+                }
+            }
+        }
 
         func consider(_ file: URL, destination: URL) {
+            if excluded.contains(file.standardizedFileURL.path) { return }
             let name = file.lastPathComponent
             if Self.isJunk(name) || name.hasPrefix(".") { return }  // Mac leftovers and hidden files
-            guard allowedExtensions.contains(file.pathExtension.lowercased()) else {
+            // A .cue for an album already on the player (copied earlier without it) is copied too,
+            // so that album can then be split there.
+            let cueForPlayerAlbum = file.pathExtension.lowercased() == "cue"
+                && CueAlbum.cue(file, fitsAudioIn: destination.deletingLastPathComponent())
+            guard cueForPlayerAlbum || allowedExtensions.contains(file.pathExtension.lowercased()) else {
                 plan.skipped.append(UploadSkip(source: file, reason: "not a music file the player plays"))
                 return
             }
@@ -100,14 +139,21 @@ extension HAPDrive {
             }
             if let existing = Self.fileSize(destination), existing > 0 {  // empty = leftover, replaced
                 let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(Int64.init) ?? 0
-                plan.skipped.append(UploadSkip(source: file, reason: Self.sameContent(file, destination, size: size)
-                    ? "already on the player"
-                    : "a different file with the same name is on the player"))
+                let same = Self.sameContent(file, destination, size: size)
+                plan.skipped.append(UploadSkip(source: file,
+                                               reason: same ? "already on the player" : "a different file with the same name is on the player",
+                                               destination: same ? destination : nil))
                 return
             }
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(Int64.init) ?? 0
             taken.insert(key)
             plan.items.append(UploadItem(source: file, destination: destination, size: size))
+        }
+
+        // Loose dropped files: a .cue dropped together with its big file is split too.
+        let droppedPaths = Set(sources.map { $0.standardizedFileURL.path })
+        for parent in Set(sources.map { $0.deletingLastPathComponent().standardizedFileURL }) {
+            findAlbums(in: parent, destination: folder, dropped: droppedPaths)
         }
 
         for source in sources {
@@ -122,6 +168,17 @@ extension HAPDrive {
                 continue
             }
             let top = folder.appendingPathComponent(Self.safeName(source.lastPathComponent), isDirectory: true)
+            // Albums in the dropped folder and every subfolder.
+            findAlbums(in: source, destination: top)
+            let folders = FileManager.default.enumerator(at: source, includingPropertiesForKeys: [.isDirectoryKey],
+                                                         options: [.skipsHiddenFiles, .skipsPackageDescendants])
+            while let sub = folders?.nextObject() as? URL {
+                guard (try? sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+                let relative = sub.standardizedFileURL.path.dropFirst(source.standardizedFileURL.path.count)
+                var destination = top
+                for part in relative.split(separator: "/") { destination.appendPathComponent(Self.safeName(String(part))) }
+                findAlbums(in: sub, destination: destination)
+            }
             let walker = FileManager.default.enumerator(
                 at: source, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
                 options: [.skipsHiddenFiles, .skipsPackageDescendants])
@@ -136,6 +193,28 @@ extension HAPDrive {
             }
         }
         plan.items.sort { $0.destination.path.localizedStandardCompare($1.destination.path) == .orderedAscending }
+        plan.albumsToSplit.sort { $0.destinationFolder.path.localizedStandardCompare($1.destinationFolder.path) == .orderedAscending }
+        return plan
+    }
+
+    /// Songs just split on the Mac, to copy into `folder`; songs already there are left alone.
+    /// `taken`: destinations (lowercased paths) other files of the same copy already use.
+    public func plan(songs: [URL], into folder: URL, taken: Set<String> = []) -> UploadPlan {
+        var plan = UploadPlan()
+        var taken = taken
+        for song in songs {
+            let destination = folder.appendingPathComponent(song.lastPathComponent)
+            guard taken.insert(destination.path.lowercased()).inserted else {
+                plan.skipped.append(UploadSkip(source: song, reason: "another file in this copy has the same name"))
+                continue
+            }
+            if let existing = Self.fileSize(destination), existing > 0 {
+                plan.skipped.append(UploadSkip(source: song, reason: "a song with this name is already on the player"))
+                continue
+            }
+            let size = (try? song.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(Int64.init) ?? 0
+            plan.items.append(UploadItem(source: song, destination: destination, size: size))
+        }
         return plan
     }
 

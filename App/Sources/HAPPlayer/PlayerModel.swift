@@ -50,6 +50,8 @@ final class PlayerModel {
     /// Where each track's file is on the drive (trackid → path inside the drive), from the
     /// player's folder view; read after each library refresh (~5 s, read-only).
     private(set) var trackPaths: [Int: String] = [:]
+    /// Counts finished library refreshes (covers are looked up after each one).
+    private(set) var libraryLoads = 0
 
     @ObservationIgnored private(set) var client: HAPClient?
     @ObservationIgnored private var listener: Task<Void, Never>?
@@ -126,6 +128,7 @@ final class PlayerModel {
             libraryError = Self.message(for: error)
         }
         await loadTrackPaths()
+        libraryLoads += 1
     }
 
     func loadTrackPaths() async {
