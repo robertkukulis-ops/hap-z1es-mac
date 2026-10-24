@@ -6,7 +6,7 @@ repeat), make playlists, see album covers, copy music to the player's hard drive
 drop, split FLAC/WAV + CUE albums into tracks, and tidy up the drive. Made because Sony's own
 apps no longer get updates.
 
-**[⬇ Download HAP Player 1.0 for Mac](https://github.com/robertkukulis-ops/hap-z1es-mac/releases/latest)**
+**[⬇ Download HAP Player 1.1 for Mac](https://github.com/robertkukulis-ops/hap-z1es-mac/releases/latest)**
 · universal (Apple silicon and Intel) · macOS 15 or later
 
 ![HAP Player on a Mac: the album covers of a HAP-Z1ES library on a big blue screen in a silver hi-fi player front, with the section buttons on an amplifier below](docs/screenshot.png)
@@ -28,6 +28,9 @@ owners.
 - **Albums in one file + .cue** (FLAC or WAV) are split into one FLAC per song, losslessly,
   checked sample by sample before copying, with tags from the .cue and the album's cover built
   in. Albums like this already on the player can be split there too.
+- **Organise the player's drive**: make new folders (button or right-click), and move songs
+  and folders by dragging them onto a folder (hold ⌥ to copy instead), or with Move / Copy to
+  Folder. Asks first; nothing is ever overwritten.
 - **Delete** songs, albums or folders from the player (asks first), and **tidy up** the hidden
   files a Mac leaves behind.
 - **Artists** with "feat." guests appear on the guest's page too; spelling variants are merged.

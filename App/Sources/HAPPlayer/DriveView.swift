@@ -7,6 +7,9 @@ struct DriveView: View {
     @Environment(PlayerModel.self) private var player
     @Environment(DriveModel.self) private var model
     @State private var dropTargeted = false
+    @State private var newFolderName = ""
+    @State private var showingNewFolder = false
+    @State private var newFolderProblem: String?
 
     var body: some View {
         Group {
@@ -48,7 +51,7 @@ struct DriveView: View {
                         Text("“\(album.audio.lastPathComponent)” holds a whole album in one file (\(album.sheet.tracks.count) songs).")
                         Spacer()
                         Button("Split into Songs…") { model.requestSplit(album) }
-                            .disabled(model.isUploading || model.isDeleting)
+                            .disabled(model.isBusy)
                     } else {
                         Text("“\(album.audio.lastPathComponent)” holds a whole album in one file, but this kind of file (\(album.audio.pathExtension.uppercased())) can't be split.")
                             .foregroundStyle(.secondary)
@@ -84,6 +87,14 @@ struct DriveView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Stop") { model.stopUploading() }
                         .help("Stop copying. Files already copied stay; the half-copied one is removed.")
+                }
+                .padding(10)
+                .background(.quaternary)
+            }
+            if model.isMoving {
+                HStack(spacing: 12) {
+                    ProgressView().controlSize(.small)
+                    Text("Moving…").frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(10)
                 .background(.quaternary)
@@ -139,8 +150,21 @@ struct DriveView: View {
                         }
                     }
                     .tag(item.url)
+                    .draggable(DriveDragItem(url: item.url)) {
+                        Label(model.selection.contains(item.url) && model.selection.count > 1
+                              ? "\(model.selection.count) items" : item.name,
+                              systemImage: item.isFolder ? "folder.fill" : "music.note")
+                            .padding(6).background(.regularMaterial, in: .rect(cornerRadius: 6))
+                    }
+                    .modifier(OptionalDropTarget(target: item.isFolder ? item.url : nil))
                 }
                 .contextMenu(forSelectionType: URL.self) { urls in
+                    Button("New Folder…") {
+                        newFolderName = ""
+                        showingNewFolder = true
+                    }
+                    .disabled(model.dropBlocker != nil || model.isBusy)
+                    if !urls.isEmpty { Divider() }
                     if urls.count == 1, let url = urls.first, let item = model.items.first(where: { $0.url == url }), !item.isFolder {
                         Button("Play") { Task { await model.play(item) } }
                     }
@@ -148,6 +172,11 @@ struct DriveView: View {
                     let songs = model.items.filter { urls.contains($0.url) && !$0.isFolder }.compactMap { model.track(for: $0) }
                     if !songs.isEmpty {
                         AddToPlaylistMenu { songs }
+                    }
+                    if !urls.isEmpty {
+                        Divider()
+                        Button("Move to Folder…") { model.requestOrganize(.move, Array(urls)) }
+                        Button("Copy to Folder…") { model.requestOrganize(.copy, Array(urls)) }
                     }
                 } primaryAction: { urls in
                     guard urls.count == 1, let url = urls.first, let item = model.items.first(where: { $0.url == url }) else { return }
@@ -179,7 +208,7 @@ struct DriveView: View {
                     .frame(minWidth: 300, idealWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
             }
             .dropDestination(for: URL.self) { urls, _ in
-                guard model.dropBlocker == nil, !model.isUploading else { return false }
+                guard model.dropBlocker == nil, !model.isBusy else { return false }
                 Task { await model.prepareUpload(urls, extensions: await player.supportedExtensions()) }
                 return true
             } isTargeted: { dropTargeted = $0 }
@@ -199,6 +228,38 @@ struct DriveView: View {
                     ProgressView("Looking at what you dropped…").padding().background(.regularMaterial, in: .rect(cornerRadius: 8))
                 }
             }
+        }
+        .sheet(item: Binding(get: { model.organizeRequest }, set: { model.organizeRequest = $0 })) { request in
+            if let drive = model.drive {
+                FolderPicker(request: request, drive: drive, start: model.folder ?? drive.root)
+                    .environment(model)
+            }
+        }
+        .confirmationDialog(
+            model.pendingOrganize?.kind == .copy ? "Copy on the player?" : "Move on the player?",
+            isPresented: Binding(get: { model.pendingOrganize != nil }, set: { if !$0 { model.cancelOrganize() } }),
+            titleVisibility: .visible,
+            presenting: model.pendingOrganize
+        ) { pending in
+            Button("\(pending.kind.verb) \(pending.count) \(pending.kind == .move ? "Item" : "File")\(pending.count == 1 ? "" : "s")") {
+                Task { await model.confirmOrganize(pending) }
+            }
+            .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { model.cancelOrganize() }
+        } message: { pending in
+            Text(OrganizeText.message(pending))
+        }
+        .alert("New folder", isPresented: $showingNewFolder) {
+            TextField("Name", text: $newFolderName)
+            Button("Create") { newFolderProblem = model.createFolder(named: newFolderName) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Inside “\(model.breadcrumbs.last?.name ?? "")”. Then drag music from your Mac into it, or move or copy songs on the player into it.")
+        }
+        .alert("Couldn't create the folder", isPresented: Binding(get: { newFolderProblem != nil }, set: { if !$0 { newFolderProblem = nil } })) {
+            Button("OK") { newFolderProblem = nil }
+        } message: {
+            Text(newFolderProblem ?? "")
         }
         .confirmationDialog(
             "Tidy up Mac leftovers?",
@@ -304,6 +365,7 @@ struct DriveView: View {
                         Button(crumb.name) { model.open(crumb.url) }
                             .buttonStyle(.borderless)
                             .fontWeight(index == model.breadcrumbs.count - 1 ? .semibold : .regular)
+                            .driveDropTarget(crumb.url)  // drag items here to move them up
                     }
                 }
             }
@@ -313,6 +375,14 @@ struct DriveView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             Button {
+                newFolderName = ""
+                showingNewFolder = true
+            } label: {
+                Label("New Folder…", systemImage: "folder.badge.plus")
+            }
+            .disabled(model.dropBlocker != nil || model.isBusy)
+            .help("Make a new, empty folder here on the player")
+            Button {
                 Task { await model.requestTidy() }
             } label: {
                 if model.isScanningLeftovers {
@@ -321,7 +391,7 @@ struct DriveView: View {
                     Label("Tidy Up…", systemImage: "sparkles")
                 }
             }
-            .disabled(model.isUploading || model.isDeleting || model.isScanningLeftovers)
+            .disabled(model.isBusy || model.isScanningLeftovers)
             .help("Remove hidden Mac leftovers (._ files, .DS_Store) from this folder and everything inside it. Music is never touched.")
             Button {
                 model.reload()
@@ -345,7 +415,9 @@ struct DriveDetails: View {
             if selected.isEmpty {
                 Text("Select a folder or file to see its size, and whether the original is still on this Mac. "
                      + "Tick the boxes to select several. Double-click a folder to open it. "
-                     + "Double-click a music file to play it. Drag music from Finder onto the list to copy it into this folder.")
+                     + "Double-click a music file to play it. Drag music from Finder onto the list to copy it into this folder. "
+                     + "Drag items onto a folder (or a name in the path bar) to move them there; hold ⌥ to copy instead. "
+                     + "Right-click for New Folder.")
                     .foregroundStyle(.secondary)
             } else {
                 Section(selected.count == 1 ? selected[0].name : "\(selected.count) items selected") {
@@ -375,12 +447,28 @@ struct DriveDetails: View {
                     }
                 }
                 Section {
+                    Button {
+                        model.requestOrganize(.move, Array(model.selection))
+                    } label: {
+                        Label("Move to Folder…", systemImage: "folder")
+                    }
+                    Button {
+                        model.requestOrganize(.copy, Array(model.selection))
+                    } label: {
+                        Label("Copy to Folder…", systemImage: "doc.on.doc")
+                    }
+                } footer: {
+                    Text("Choose a folder on the player, then confirm. Nothing is overwritten.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(model.organizeBlocker != nil)
+                Section {
                     Button(role: .destructive) {
                         Task { await model.requestDelete() }
                     } label: {
                         Label(model.isDeleting ? "Deleting…" : "Delete from Player…", systemImage: "trash")
                     }
-                    .disabled(model.deleteBlocker != nil || model.isDeleting)
+                    .disabled(model.deleteBlocker != nil || model.isBusy)
                     if let blocker = model.deleteBlocker, blocker != "Nothing selected" {
                         Text(blocker).font(.caption).foregroundStyle(.secondary)
                     }
@@ -408,5 +496,13 @@ struct DriveDetails: View {
         case .unknown:
             Text("Unknown").foregroundStyle(.secondary)
         }
+    }
+}
+
+/// Folder rows take dropped items; file rows don't.
+private struct OptionalDropTarget: ViewModifier {
+    let target: URL?
+    func body(content: Content) -> some View {
+        if let target { content.driveDropTarget(target) } else { content }
     }
 }

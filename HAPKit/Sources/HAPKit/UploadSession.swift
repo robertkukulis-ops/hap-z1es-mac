@@ -78,6 +78,10 @@ public final class UploadSession: @unchecked Sendable {
         let folders = Set(plan.items.map { planned.relativePath(of: $0.destination.deletingLastPathComponent()) })
         for folder in folders { HAPDrive.removeTemporaryCopies(in: planned.root.appendingPathComponent(folder)) }
 
+        // Every destination must be on the drive the plan was made for (never a stray path).
+        for item in plan.items where !item.destination.standardizedFileURL.path.hasPrefix(planned.root.path + "/") {
+            throw UploadError.outsideDrive(item.destination.path)
+        }
         var state = UploadProgress()
         for (index, item) in plan.items.enumerated() {
             let relative = planned.relativePath(of: item.destination)
@@ -88,7 +92,11 @@ public final class UploadSession: @unchecked Sendable {
                 attempt += 1
                 if Task.isCancelled { throw CancellationError() }
                 let drive = self.drive
-                let target = UploadItem(source: item.source,
+                // A source on the player itself (copying within the drive) follows the reconnect too.
+                let source = item.source.standardizedFileURL.path.hasPrefix(planned.root.path + "/")
+                    ? drive.root.appendingPathComponent(planned.relativePath(of: item.source))
+                    : item.source
+                let target = UploadItem(source: source,
                                         destination: drive.root.appendingPathComponent(relative),
                                         size: item.size)
                 let temporary = HAPDrive.temporaryURL(for: target.destination)
@@ -96,7 +104,7 @@ public final class UploadSession: @unchecked Sendable {
                 do {
                     defer { watchdog.stop() }
                     if let existing = HAPDrive.fileSize(target.destination) {
-                        if HAPDrive.sameContent(item.source, target.destination, size: item.size) {
+                        if HAPDrive.sameContent(source, target.destination, size: item.size) {
                             break attempts  // already there, complete (resume)
                         }
                         guard existing == 0 else {
@@ -105,7 +113,7 @@ public final class UploadSession: @unchecked Sendable {
                         // An empty file can't be music: a leftover from an interrupted copy.
                         try FileManager.default.removeItem(at: target.destination)
                     }
-                    try beforeCopy?(UploadItem(source: item.source, destination: temporary, size: item.size), attempt)
+                    try beforeCopy?(UploadItem(source: source, destination: temporary, size: item.size), attempt)
                     let before = state
                     try drive.copyAndCheck(target, via: temporary) { bytes in
                         watchdog.touch()

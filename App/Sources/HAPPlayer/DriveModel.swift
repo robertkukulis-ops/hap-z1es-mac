@@ -78,7 +78,7 @@ final class DriveModel {
 
     /// Step 1 after a drop: work out what would be copied (nothing is copied yet).
     func prepareUpload(_ urls: [URL], extensions: Set<String>) async {
-        guard let drive, let folder, !isUploading else { return }
+        guard let drive, let folder, !isBusy else { return }
         isPlanningUpload = true
         defer { isPlanningUpload = false }
         do {
@@ -492,7 +492,7 @@ final class DriveModel {
 
     /// Step 1: count exactly what would go, then ask for confirmation.
     func requestDelete() async {
-        guard let drive, deleteBlocker == nil else { return }
+        guard let drive, deleteBlocker == nil, !isBusy else { return }
         let urls = selection.sorted { $0.path < $1.path }
         let summary = await Task.detached { drive.count(urls) }.value
         pendingDeletion = PendingDeletion(urls: urls, names: urls.map(\.lastPathComponent),
@@ -551,6 +551,184 @@ final class DriveModel {
         }
         deleteTask = nil
         isDeleting = false
+        reload()
+    }
+
+    // MARK: New folders, moving and copying on the player
+
+    /// Creates an empty folder in the open folder; nil if it worked, otherwise why not.
+    func createFolder(named name: String) -> String? {
+        guard let drive, let folder else { return "The drive isn't connected." }
+        do {
+            let made = try drive.createFolder(named: name, in: folder)
+            reload()
+            selection = [made]
+            return nil
+        } catch {
+            return PlayerModel.message(for: error)
+        }
+    }
+
+    enum OrganizeKind: Equatable {
+        case move, copy
+        var verb: String { self == .move ? "Move" : "Copy" }
+    }
+
+    /// Choosing where to move or copy these items (the folder chooser shows it).
+    struct OrganizeRequest: Identifiable {
+        let id = UUID()
+        let kind: OrganizeKind
+        let urls: [URL]
+    }
+
+    /// Waiting for "Move here" / "Copy here" to be confirmed.
+    struct PendingOrganize {
+        let kind: OrganizeKind
+        let destination: URL
+        let destinationName: String
+        /// Where the drive was on the Mac when this was planned (it can reconnect elsewhere).
+        let planRoot: URL
+        var moves = MovePlan()
+        var copies = UploadPlan()
+        var count: Int { kind == .move ? moves.moves.count : copies.items.count }
+        var skipped: [UploadSkip] { kind == .move ? moves.skipped : copies.skipped }
+    }
+
+    var organizeRequest: OrganizeRequest?
+    private(set) var pendingOrganize: PendingOrganize?
+    private(set) var isMoving = false
+
+    /// Copying, splitting, deleting or moving: only one job on the drive at a time.
+    var isBusy: Bool { isUploading || isDeleting || isMoving || splitStatus != nil }
+
+    /// Why the selection can't be moved or copied, or nil if it can.
+    var organizeBlocker: String? {
+        if isBusy { return "Wait until the current job has finished." }
+        return deleteBlocker  // the same rules: on the drive, not the drive itself or lost+found
+    }
+
+    func requestOrganize(_ kind: OrganizeKind, _ urls: [URL]) {
+        guard !urls.isEmpty, !isBusy else { return }
+        organizeRequest = OrganizeRequest(kind: kind, urls: urls.sorted { $0.path < $1.path })
+    }
+
+    /// The folder was chosen: work out exactly what would happen (nothing changes yet).
+    func prepareOrganize(_ request: OrganizeRequest, into destination: URL) async {
+        guard let drive else { return }
+        organizeRequest = nil
+        do {
+            let kind = request.kind, urls = request.urls
+            var pending = PendingOrganize(kind: kind, destination: destination,
+                                          destinationName: drive.relativePath(of: destination).isEmpty
+                                              ? "HAP_Internal" : drive.relativePath(of: destination),
+                                          planRoot: drive.root)
+            if kind == .move {
+                pending.moves = try await Task.detached { try drive.planMove(urls, into: destination) }.value
+            } else {
+                pending.copies = try await Task.detached { try drive.planCopy(urls, into: destination) }.value
+            }
+            if pending.count == 0 {
+                lastResult = "Nothing to \(kind.verb.lowercased())." + Self.skipSummary(pending.skipped)
+            } else {
+                pendingOrganize = pending
+            }
+        } catch {
+            lastResult = PlayerModel.message(for: error)
+        }
+    }
+
+    func cancelOrganize() { pendingOrganize = nil }
+
+    /// Items dragged onto a folder (in the list or the path bar): move them there, or copy
+    /// them with ⌥ held. A dragged item that's selected brings the whole selection along.
+    /// The confirmation comes next; nothing moves before it.
+    func drop(_ urls: [URL], into target: URL, copy: Bool) {
+        let dragged = urls.contains(where: selection.contains) ? Array(selection) : urls
+        // Let go on one of the dragged items itself: nothing happens (like Finder).
+        guard !dragged.isEmpty, !isBusy,
+              !dragged.contains(where: { $0.standardizedFileURL.path == target.standardizedFileURL.path }) else { return }
+        let request = OrganizeRequest(kind: copy ? .copy : .move, urls: dragged.sorted { $0.path < $1.path })
+        Task { await prepareOrganize(request, into: target) }
+    }
+
+    /// Only after the user confirmed: moves (renames on the drive) or copies (checked, like uploads).
+    func confirmOrganize(_ pending: PendingOrganize) async {
+        pendingOrganize = nil
+        if pending.kind == .move { await move(pending) } else { await copy(pending) }
+    }
+
+    /// The same place on the drive as connected now (it may have reconnected at another folder
+    /// on the Mac since the plan was made).
+    private static func rerooted(_ url: URL, from old: URL, to new: URL) -> URL {
+        guard old.path != new.path else { return url }
+        return new.appendingPathComponent(HAPDrive(root: old).relativePath(of: url))
+    }
+
+    private func move(_ pending: PendingOrganize) async {
+        guard let drive else { return }
+        isMoving = true
+        lastResult = nil
+        var plan = pending.moves
+        plan.moves = plan.moves.map {
+            PlannedMove(source: Self.rerooted($0.source, from: pending.planRoot, to: drive.root),
+                        destination: Self.rerooted($0.destination, from: pending.planRoot, to: drive.root))
+        }
+        do {
+            let moved = try await Task.detached { try drive.move(plan) }.value
+            lastResult = "Moved \(moved.count) item\(moved.count == 1 ? "" : "s") to “\(pending.destinationName)”."
+                + Self.skipSummary(pending.skipped)
+                + " The player finds them in their new place by itself, usually within a few minutes."
+        } catch {
+            lastResult = "Moving stopped: \(PlayerModel.message(for: error)) What was already moved stays in “\(pending.destinationName)”."
+        }
+        isMoving = false
+        selection = []
+        reload()
+        await player?.refreshLibrary()
+    }
+
+    private func copy(_ pending: PendingOrganize) async {
+        guard let drive, !hosts.isEmpty else {
+            lastResult = "The drive isn't connected, so nothing was copied."
+            return
+        }
+        var plan = pending.copies
+        plan.items = plan.items.map {
+            UploadItem(source: Self.rerooted($0.source, from: pending.planRoot, to: drive.root),
+                       destination: Self.rerooted($0.destination, from: pending.planRoot, to: drive.root), size: $0.size)
+        }
+        isUploading = true
+        uploadProgress = UploadProgress()
+        uploadTotalFiles = plan.items.count
+        uploadTotalBytes = plan.totalBytes
+        lastResult = nil
+        let throttle = ProgressThrottle()
+        let session = UploadSession(hosts: hosts, drive: drive)
+        let folderPath = folder.map { drive.relativePath(of: $0) } ?? ""
+        let task = Task.detached {
+            try session.upload(plan) { progress in
+                guard throttle.shouldReport(progress) else { return }
+                Task { @MainActor [weak self] in self?.uploadProgress = progress }
+            }
+        }
+        uploadTask = task
+        do {
+            try await task.value
+            lastResult = "Copied \(plan.items.count) file\(plan.items.count == 1 ? "" : "s") (\(Self.bytes(plan.totalBytes))) to “\(pending.destinationName)”."
+                + Self.skipSummary(plan.skipped)
+                + " The originals stay where they were. The player adds the copies to its library by itself."
+        } catch is CancellationError {
+            lastResult = "Stopped. \(uploadProgress.filesDone) of \(plan.items.count) files were copied. Copy the same items again to continue: complete ones are skipped."
+        } catch {
+            lastResult = "Copying stopped: \(PlayerModel.message(for: error)) \(uploadProgress.filesDone) files were copied before that."
+        }
+        // The drive may now be connected at a different folder on the Mac.
+        let fresh = session.drive
+        self.drive = fresh
+        folder = folderPath.isEmpty ? fresh.root : fresh.root.appendingPathComponent(folderPath)
+        uploadTask = nil
+        isUploading = false
+        selection = []
         reload()
     }
 
@@ -651,7 +829,7 @@ final class DriveModel {
 
     /// Step 1: count the Mac leftovers in the current folder and everything inside it.
     func requestTidy() async {
-        guard let drive, let folder, !isUploading, !isDeleting else { return }
+        guard let drive, let folder, !isBusy else { return }
         isScanningLeftovers = true
         defer { isScanningLeftovers = false }
         let found = await Task.detached { drive.macLeftovers(in: folder) }.value

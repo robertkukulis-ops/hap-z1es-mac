@@ -19,12 +19,20 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>app.hap-player.HAP</string>
     <key>CFBundleExecutable</key><string>HAP</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key><string>6</string>
+    <key>CFBundleShortVersionString</key><string>1.1</string>
+    <key>CFBundleVersion</key><string>7</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key><string>HAP talks to your Sony HAP player on the local network.</string>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>local.hap-player.drive-item</string>
+            <key>UTTypeDescription</key><string>Item on the HAP's drive</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

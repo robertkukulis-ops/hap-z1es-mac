@@ -254,7 +254,7 @@ public struct HAPDrive: Sendable {
     /// Path inside the drive, e.g. "My Mac/Users/me/Music/Logic".
     public func relativePath(of url: URL) -> String {
         let full = url.standardizedFileURL.path
-        guard full.hasPrefix(root.path) else { return full }
+        guard full == root.path || full.hasPrefix(root.path + "/") else { return full }
         return String(full.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 

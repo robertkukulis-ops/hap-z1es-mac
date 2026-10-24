@@ -14,6 +14,12 @@ public struct UploadItem: Sendable, Equatable, Identifiable {
     public let destination: URL
     public let size: Int64
     public var id: URL { destination }
+
+    public init(source: URL, destination: URL, size: Int64) {
+        self.source = source
+        self.destination = destination
+        self.size = size
+    }
 }
 
 /// Something that won't be copied, and why.
@@ -37,6 +43,8 @@ public struct UploadPlan: Sendable, Equatable {
     public var skipped: [UploadSkip] = []
     public var albumsToSplit: [PlannedSplit] = []
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.size } }
+
+    public init() {}
 }
 
 public struct UploadProgress: Sendable, Equatable {
